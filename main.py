@@ -6,6 +6,7 @@ import csv
 import io
 import json
 import zipfile
+import threading
 
 app = FastAPI()
 
@@ -14,16 +15,54 @@ BASE_DIR = Path(__file__).parent
 SESSIONS_DIR = BASE_DIR / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
 
-# ---------- Global state ----------
+SESSION_STATE_FILE = BASE_DIR / "session_state.json"
+
+# ---------- In-memory cache + lock ----------
+state_lock = threading.Lock()
+
+# These are just local caches for this process
 logging_enabled: bool = False
 start_epoch: int = 0
 current_session_id: str | None = None
-current_session_dir: Path | None = None  # active session directory
+current_session_dir: Path | None = None
 
 
-def utc_now_iso() -> str:
-    """UTC timestamp with microsecond precision."""
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+# =============== STATE HELPERS (shared across workers) ===============
+def default_state() -> dict:
+    return {
+        "logging": False,
+        "start_epoch": 0,
+        "session_id": None,
+    }
+
+
+def load_state() -> dict:
+    if not SESSION_STATE_FILE.exists():
+        return default_state()
+    try:
+        with SESSION_STATE_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        # ensure required keys
+        for k, v in default_state().items():
+            data.setdefault(k, v)
+        return data
+    except Exception:
+        return default_state()
+
+
+def save_state(state: dict) -> None:
+    with SESSION_STATE_FILE.open("w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+
+def sync_from_state(state: dict) -> None:
+    """Copy shared state into this worker's globals."""
+    global logging_enabled, start_epoch, current_session_id, current_session_dir
+    logging_enabled = bool(state.get("logging", False))
+    start_epoch = int(state.get("start_epoch", 0) or 0)
+    sid = state.get("session_id")
+    current_session_id = sid
+    current_session_dir = SESSIONS_DIR / sid if sid else None
 
 
 def new_session_id() -> str:
@@ -31,11 +70,19 @@ def new_session_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
-# ---------- CSV Helpers ----------
+def utc_now_iso() -> str:
+    """UTC timestamp with microsecond precision."""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+# =============== CSV HELPERS ===============
 def get_device_csv_path(device_id: str) -> Path:
+    """
+    Uses the current_session_dir if available, otherwise falls back to a
+    global orphan file (should only happen in weird edge cases).
+    """
     global current_session_dir
     if current_session_dir is None:
-        # Fallback – shouldn't normally happen when session is running
         return SESSIONS_DIR / f"orphan_{device_id}.csv"
     return current_session_dir / f"{device_id}.csv"
 
@@ -63,7 +110,7 @@ def append_samples(device_id: str, samples: list[dict], fieldnames: list[str]) -
             writer.writerow(row)
 
 
-# ---------- ROUTES ----------
+# =============== ROUTES ===============
 @app.get("/")
 async def root():
     return HTMLResponse("<h2>IoT Logger</h2><p>Go to <a href='/dashboard'>Dashboard</a></p>")
@@ -71,7 +118,6 @@ async def root():
 
 @app.get("/dashboard")
 async def dashboard():
-    # Simple embedded dashboard for testing
     html = """
     <!DOCTYPE html>
     <html>
@@ -92,7 +138,7 @@ async def dashboard():
             <button onclick="stopSession()">STOP & Download</button>
         </div>
         <div id="statusBox" class="status stopped">Status: Stopped</div>
-        <div id="info"></div>
+        <pre id="info"></pre>
 
         <script>
             async function updateStatus() {
@@ -118,7 +164,7 @@ async def dashboard():
             }
 
             async function stopSession() {
-                window.location.href = '/api/stop'; // Triggers download
+                window.location.href = '/api/stop';
                 setTimeout(updateStatus, 1000);
             }
 
@@ -134,55 +180,76 @@ async def dashboard():
 # ---------------- START SESSION ----------------
 @app.post("/api/start")
 async def api_start():
-    global logging_enabled, start_epoch, current_session_id, current_session_dir
+    global current_session_dir
 
-    if logging_enabled:
+    with state_lock:
+        state = load_state()
+        if state["logging"] and state.get("session_id"):
+            # Already running – sync globals and return existing
+            sync_from_state(state)
+            return {
+                "status": "already_running",
+                "session_id": state["session_id"],
+                "start_epoch": state["start_epoch"],
+            }
+
+        now = datetime.now(timezone.utc)
+        start_epoch = int(now.timestamp())
+        session_id = new_session_id()
+        session_dir = SESSIONS_DIR / session_id
+        session_dir.mkdir(exist_ok=True, parents=True)
+
+        # Update state on disk
+        state["logging"] = True
+        state["start_epoch"] = start_epoch
+        state["session_id"] = session_id
+        save_state(state)
+
+        # Sync into this worker
+        sync_from_state(state)
+        current_session_dir = session_dir
+
+        print(f"✅ Session STARTED: {session_id}")
+
         return {
-            "status": "already_running",
-            "session_id": current_session_id,
+            "status": "started",
+            "session_id": session_id,
             "start_epoch": start_epoch,
+            "start_time_utc": now.isoformat().replace("+00:00", "Z"),
         }
-
-    logging_enabled = True
-    now = datetime.now(timezone.utc)
-    start_epoch = int(now.timestamp())
-    current_session_id = new_session_id()
-    current_session_dir = SESSIONS_DIR / current_session_id
-    current_session_dir.mkdir(exist_ok=True, parents=True)
-
-    print(f"✅ Session STARTED: {current_session_id}")
-
-    return {
-        "status": "started",
-        "session_id": current_session_id,
-        "start_epoch": start_epoch,
-        "start_time_utc": now.isoformat().replace("+00:00", "Z"),
-    }
 
 
 # ---------------- STOP SESSION ----------------
 @app.get("/api/stop")
 async def api_stop():
-    global logging_enabled, start_epoch, current_session_id, current_session_dir
+    with state_lock:
+        state = load_state()
+        session_id = state.get("session_id")
+        if not session_id:
+            return {"status": "error", "message": "No active session"}
 
-    if not current_session_dir or not current_session_id:
-        return {"status": "error", "message": "No active session"}
+        session_dir = SESSIONS_DIR / session_id
 
-    session_dir = current_session_dir
-    session_id = current_session_id
+        # Reset shared state
+        state["logging"] = False
+        state["start_epoch"] = 0
+        # Keep session_id in state for reference, or set to None
+        state["session_id"] = None
+        save_state(state)
 
-    # Reset state so Arduino stops logging
-    logging_enabled = False
-    start_epoch = 0
-    current_session_id = None
-    current_session_dir = None
+        # Update local globals
+        sync_from_state(state)
 
-    print(f"🛑 Session STOPPED: {session_id}")
+        print(f"🛑 Session STOPPED: {session_id}")
 
     # Build ZIP in memory
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        files = list(session_dir.glob("*.csv"))
+        if session_dir.exists():
+            files = list(session_dir.glob("*.csv"))
+        else:
+            files = []
+
         if not files:
             zf.writestr("empty.txt", "No data collected.")
         else:
@@ -202,23 +269,21 @@ async def api_stop():
 # ---------------- CONFIG FOR ARDUINO ----------------
 @app.get("/api/config")
 async def api_config(device_id: str):
-    """
-    Arduino polls this to know IF it should log and WHAT the time is.
-    """
+    # Always read from shared state so all workers agree
+    state = load_state()
     return {
-        "logging": logging_enabled,
-        "start_epoch": start_epoch,
+        "logging": state["logging"],
+        "start_epoch": state["start_epoch"],
     }
 
 
 # ---------------- BULK UPLOAD FROM ARDUINO ----------------
 @app.post("/api/bulk_samples")
 async def api_bulk_samples(request: Request):
-    global logging_enabled, current_session_dir, current_session_id
+    global current_session_dir
 
     body = await request.body()
     print("📥 /api/bulk_samples called")
-    print(f"  logging_enabled={logging_enabled}, current_session_dir={current_session_dir}")
     print(f"  body_len={len(body)}")
 
     try:
@@ -238,18 +303,19 @@ async def api_bulk_samples(request: Request):
         print(f"ℹ️ No samples in request for device {device_id}")
         return {"status": "ok", "written": 0}
 
-    # If for some reason the process restarted and lost session_dir,
-    # create a fallback "orphan" session so you never lose data.
-    if current_session_dir is None:
-        fallback_id = current_session_id or f"orphan_{new_session_id()}"
-        current_session_dir = SESSIONS_DIR / fallback_id
-        current_session_dir.mkdir(exist_ok=True, parents=True)
-        print(f"⚠️ No active session_dir, using fallback: {current_session_dir}")
+    # Make sure this worker knows the current session from shared state
+    state = load_state()
+    if state.get("session_id"):
+        current_session_dir = SESSIONS_DIR / state["session_id"]
+    else:
+        # If no active session, still save to an orphan file so nothing is lost
+        current_session_dir = None
 
     first = samples[0]
     fieldnames = sorted(first.keys())
 
     print(f"  device_id={device_id}, sample_count={len(samples)}, fieldnames={fieldnames}")
+    print(f"  session_dir={current_session_dir}")
 
     ensure_device_csv(device_id, fieldnames)
     append_samples(device_id, samples, fieldnames)
