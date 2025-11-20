@@ -14,17 +14,25 @@ The server provides a web dashboard to Start/Stop data recording sessions. When 
 
 ### Prerequisites
 
-* Python 3.9+
-* `fastapi`
-* `uvicorn`
+- Python 3.9+
+- Git
 
 ### Installation
 
-1.  Install dependencies:
-    ```bash
-    pip install fastapi uvicorn
-    ```
-2.  Save the python code as `server.py`.
+1. **Clone the repository**
+   ```bash
+   git clone git@github.com:coderalnaim/fastapi-arduino-logger.git
+   ```
+
+2. **Enter the project folder**
+   ```bash
+   cd fastapi-arduino-logger
+   ```
+
+3. **Install dependencies from `requirements.txt`**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
 ### Running the Server
 
@@ -176,4 +184,5 @@ Your `loop()` should look like this to ensure stability:
 * **Connection Failed:** Check your Firewall. You might need to allow Python/Uvicorn through Windows Firewall on Private/Public networks.
 * **WiFi Issues:** Ensure the Arduino is connected to a 2.4GHz WiFi network (many Arduinos do not support 5GHz).
 * **JSON Errors:** Ensure you aren't sending trailing commas in the JSON list.
+
 * **Memory Issues:** If the Arduino crashes, reduce `MAX_SAMPLES` or use `F()` macro for static strings if using AVR boards.
