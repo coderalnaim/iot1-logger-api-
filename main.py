@@ -18,18 +18,20 @@ SESSIONS_DIR.mkdir(exist_ok=True)
 logging_enabled = False
 start_epoch = None
 current_session_id = None
-current_session_dir: Path | None = None  # type: ignore[assignment]
+current_session_dir: Path | None = None  # active session directory
 
 
 def utc_now_iso() -> str:
+    """UTC timestamp with microsecond precision."""
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def new_session_id() -> str:
+    """Folder-friendly timestamp ID."""
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
-# ---------- Helpers ----------
+# ---------- CSV Helpers ----------
 def get_device_csv_path(device_id: str) -> Path:
     assert current_session_dir is not None
     return current_session_dir / f"{device_id}.csv"
@@ -37,8 +39,8 @@ def get_device_csv_path(device_id: str) -> Path:
 
 def ensure_device_csv(device_id: str, fieldnames: list[str]) -> None:
     """
-    If CSV for this device does not exist yet, create it and write header:
-    server_time_utc,device_id,<fieldnames...>
+    Create CSV for this device (if not exists) with header:
+    server_time_utc, device_id, <fieldnames...>
     """
     csv_path = get_device_csv_path(device_id)
     if csv_path.exists():
@@ -46,14 +48,11 @@ def ensure_device_csv(device_id: str, fieldnames: list[str]) -> None:
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        header = ["server_time_utc", "device_id"] + fieldnames
-        writer.writerow(header)
+        writer.writerow(["server_time_utc", "device_id"] + fieldnames)
 
 
 def append_samples(device_id: str, samples: list[dict], fieldnames: list[str]) -> None:
-    """
-    Append all samples of this device to its CSV file.
-    """
+    """Append sample rows to device CSV."""
     csv_path = get_device_csv_path(device_id)
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -64,10 +63,10 @@ def append_samples(device_id: str, samples: list[dict], fieldnames: list[str]) -
             writer.writerow(row)
 
 
-# ---------- Routes ----------
+# ---------- ROUTES ----------
 @app.get("/")
 async def root():
-    return HTMLResponse("<h2>IoT Logger</h2><p>Go to <a href='/dashboard'>/dashboard</a></p>")
+    return HTMLResponse("<h2>IoT Logger</h2><p>Go to <a href='/dashboard'>Dashboard</a></p>")
 
 
 @app.get("/dashboard")
@@ -76,18 +75,18 @@ async def dashboard():
     return HTMLResponse(html)
 
 
+# ---------------- START SESSION ----------------
 @app.post("/api/start")
 async def api_start():
     """
-    Start a new logging session:
-    - sets logging_enabled = True
-    - records start_epoch
-    - creates a new /sessions/<session_id> directory
+    Start new logging session:
+    - enables logging
+    - sets start_epoch
+    - creates session directory
     """
     global logging_enabled, start_epoch, current_session_id, current_session_dir
 
     if logging_enabled:
-        # Already running, return current info
         return {
             "status": "already_running",
             "session_id": current_session_id,
@@ -109,27 +108,27 @@ async def api_start():
     }
 
 
+# ---------------- STOP SESSION ----------------
 @app.post("/api/stop")
 async def api_stop():
     """
-    Stop logging and return a ZIP file with all device CSVs for this session.
+    Stop logging, return ZIP of all CSV files.
     """
     global logging_enabled, start_epoch, current_session_id, current_session_dir
 
     if current_session_dir is None or current_session_id is None:
         raise HTTPException(status_code=400, detail="No active session to stop")
 
-    # Keep local copy of session_dir before we clear global state
     session_dir = current_session_dir
     session_id = current_session_id
 
-    # Reset state for next run
+    # Reset state
     logging_enabled = False
     start_epoch = None
-    current_session_dir = None
     current_session_id = None
+    current_session_dir = None
 
-    # Create ZIP in memory
+    # Build ZIP in memory
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for csv_file in session_dir.glob("*.csv"):
@@ -139,18 +138,20 @@ async def api_stop():
     return StreamingResponse(
         mem,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename=\"session_{session_id}.zip\""}
+        headers={
+            "Content-Disposition": f'attachment; filename="session_{session_id}.zip"'
+        }
     )
 
 
+# ---------------- CONFIG FOR ARDUINO ----------------
 @app.get("/api/config")
 async def api_config(device_id: str):
     """
-    Polled by Arduino.
+    Arduino polls this.
     Returns:
-    - logging: whether logging is currently enabled on server
-    - start_epoch: the UTC epoch when the current session started
-    (Arduino uses this as its baseEpoch for timestamps.)
+    - logging: True/False (server is currently logging)
+    - start_epoch: when logging began (None if not started)
     """
     return {
         "logging": logging_enabled,
@@ -158,33 +159,30 @@ async def api_config(device_id: str):
     }
 
 
+# ---------------- BULK UPLOAD FROM ARDUINO ----------------
 @app.post("/api/bulk_samples")
 async def api_bulk_samples(request: Request):
     """
-    Arduino sends chunks:
+    Body expected:
     {
       "device_id": "tof_01",
       "samples": [
-        {
-          "timestamp_utc": "...",
+         {"timestamp_utc": "...",
           "sensor_time_ms": ...,
           "distance_m": ...,
           "status": ...,
           "signal": ...,
-          "precision_cm": ...
-        },
-        ...
+          "precision_cm": ...}
       ]
     }
-
-    If logging is disabled or no active session, data is ignored.
     """
     global logging_enabled, current_session_dir
 
+    # If not logging, ignore data silently (Arduino keeps running)
     if not logging_enabled or current_session_dir is None:
-        # Ignore but reply OK so Arduino isn't confused
         return {"status": "ignored", "reason": "not_logging"}
 
+    # Parse JSON
     body = await request.body()
     try:
         data = json.loads(body)
@@ -194,23 +192,26 @@ async def api_bulk_samples(request: Request):
     device_id = data.get("device_id")
     samples = data.get("samples")
 
-    if not isinstance(device_id, str) or not isinstance(samples, list):
-        raise HTTPException(status_code=400, detail="device_id (str) and samples (list) required")
+    if not isinstance(device_id, str):
+        raise HTTPException(status_code=400, detail="device_id must be string")
+
+    if not isinstance(samples, list):
+        raise HTTPException(status_code=400, detail="samples must be list")
 
     if len(samples) == 0:
         return {"status": "ok", "written": 0}
 
-    # Fieldnames are the keys of the first sample, sorted for consistency
+    # Determine fieldnames from first sample
     first = samples[0]
     if not isinstance(first, dict):
-        raise HTTPException(status_code=400, detail="samples must contain objects")
+        raise HTTPException(status_code=400, detail="Invalid sample object")
 
     fieldnames = sorted(first.keys())
 
-    # Ensure CSV exists with proper header
+    # Create CSV if needed
     ensure_device_csv(device_id, fieldnames)
 
-    # Append all samples
+    # Append rows
     append_samples(device_id, samples, fieldnames)
 
     return {"status": "ok", "written": len(samples)}
