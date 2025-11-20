@@ -20,7 +20,6 @@ SESSION_STATE_FILE = BASE_DIR / "session_state.json"
 # ---------- In-memory cache + lock ----------
 state_lock = threading.Lock()
 
-# These are just local caches for this process
 logging_enabled: bool = False
 start_epoch: int = 0
 current_session_id: str | None = None
@@ -42,7 +41,6 @@ def load_state() -> dict:
     try:
         with SESSION_STATE_FILE.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        # ensure required keys
         for k, v in default_state().items():
             data.setdefault(k, v)
         return data
@@ -56,31 +54,25 @@ def save_state(state: dict) -> None:
 
 
 def sync_from_state(state: dict) -> None:
-    """Copy shared state into this worker's globals."""
     global logging_enabled, start_epoch, current_session_id, current_session_dir
     logging_enabled = bool(state.get("logging", False))
-    start_epoch = int(state.get("start_epoch", 0) or 0)
+    start_epoch_val = int(state.get("start_epoch", 0) or 0)
+    start_epoch = start_epoch_val
     sid = state.get("session_id")
     current_session_id = sid
     current_session_dir = SESSIONS_DIR / sid if sid else None
 
 
 def new_session_id() -> str:
-    """Folder-friendly timestamp ID."""
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
 def utc_now_iso() -> str:
-    """UTC timestamp with microsecond precision."""
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 # =============== CSV HELPERS ===============
 def get_device_csv_path(device_id: str) -> Path:
-    """
-    Uses the current_session_dir if available, otherwise falls back to a
-    global orphan file (should only happen in weird edge cases).
-    """
     global current_session_dir
     if current_session_dir is None:
         return SESSIONS_DIR / f"orphan_{device_id}.csv"
@@ -185,7 +177,6 @@ async def api_start():
     with state_lock:
         state = load_state()
         if state["logging"] and state.get("session_id"):
-            # Already running – sync globals and return existing
             sync_from_state(state)
             return {
                 "status": "already_running",
@@ -199,13 +190,11 @@ async def api_start():
         session_dir = SESSIONS_DIR / session_id
         session_dir.mkdir(exist_ok=True, parents=True)
 
-        # Update state on disk
         state["logging"] = True
         state["start_epoch"] = start_epoch
         state["session_id"] = session_id
         save_state(state)
 
-        # Sync into this worker
         sync_from_state(state)
         current_session_dir = session_dir
 
@@ -230,19 +219,15 @@ async def api_stop():
 
         session_dir = SESSIONS_DIR / session_id
 
-        # Reset shared state
         state["logging"] = False
         state["start_epoch"] = 0
-        # Keep session_id in state for reference, or set to None
         state["session_id"] = None
         save_state(state)
 
-        # Update local globals
         sync_from_state(state)
 
         print(f"🛑 Session STOPPED: {session_id}")
 
-    # Build ZIP in memory
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         if session_dir.exists():
@@ -269,7 +254,6 @@ async def api_stop():
 # ---------------- CONFIG FOR ARDUINO ----------------
 @app.get("/api/config")
 async def api_config(device_id: str):
-    # Always read from shared state so all workers agree
     state = load_state()
     return {
         "logging": state["logging"],
@@ -303,12 +287,10 @@ async def api_bulk_samples(request: Request):
         print(f"ℹ️ No samples in request for device {device_id}")
         return {"status": "ok", "written": 0}
 
-    # Make sure this worker knows the current session from shared state
     state = load_state()
     if state.get("session_id"):
         current_session_dir = SESSIONS_DIR / state["session_id"]
     else:
-        # If no active session, still save to an orphan file so nothing is lost
         current_session_dir = None
 
     first = samples[0]
