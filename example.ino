@@ -1,13 +1,15 @@
 #include <WiFiS3.h>
 
 // ---------- WIFI ----------
-char WIFI_SSID[] = "test";
-char WIFI_PASS[] = "12345678";
+const char* WIFI_SSID = "Your_WiFi_Name";
+const char* WIFI_PASS = "Your_WiFi_Password";
 
 // ---------- API ----------
-const char* API_HOST = "10.221.x.x";   // <-- your PC's LAN IP
+// FIND YOUR PC IP: Run 'ipconfig' (Windows) or 'ifconfig' (Mac/Linux)
+const char* API_HOST = "192.168.X.X"; 
 const int   API_PORT = 8000;
-const char* DEVICE_ID = "tof_01";
+
+const char* DEVICE_ID = "tof_sensor_01"; // Unique name for the connected sensor
 
 // Separate clients for config + upload
 WiFiClient configClient;
